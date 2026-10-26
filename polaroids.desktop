@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Polaroids
+Comment=Photos pinned to the desktop
+Exec=sh -c 'systemctl --user reset-failed polaroids 2>/dev/null; systemctl --user start polaroids'
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

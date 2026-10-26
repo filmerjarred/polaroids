@@ -1,0 +1,13 @@
+[Unit]
+Description=Polaroids (photos pinned to the desktop)
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jarred/projects/polaroids
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/jarred/.Xauthority
+ExecStart=/usr/bin/python3 /home/jarred/projects/polaroids/polaroids.py
+# Quit from the tray exits cleanly and stays stopped; a crash or lost X connection brings it back.
+Restart=on-failure
+RestartSec=3
+SyslogIdentifier=polaroids
