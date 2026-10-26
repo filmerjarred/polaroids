@@ -6,7 +6,10 @@ window, so it sits above the wallpaper and desktop icons and under every
 normal app.
 
 Photos are cropped to a centred square inside a card with real Polaroid
-proportions (right-click **Square crop** to show the whole image instead).
+proportions. Right-click, **Fit** to change that: show the whole image, keep
+the top/bottom (or left/right) edge instead of the middle, or turn the photo
+on its side or upside down inside the frame. Arrow keys slide the crop in
+small steps while a polaroid has focus.
 
 Runs on Python 3 + GTK 3 (PyGObject) plus libX11 via ctypes, all of which
 Linux Mint ships. X11 only: the keep-below hints and the key grab do not exist
@@ -60,7 +63,7 @@ also finishes. Captions are saved in `state.json`.
     inbox/      watched folder; files here become polaroids
     images/     the images in use
     trash/      removed images
-    state.json  position, size, angle, crop and caption of every polaroid
+    state.json  position, size, angle, crop, turn and caption of every polaroid
 
 ## Controls
 
@@ -73,6 +76,7 @@ also finishes. Captions are saved in `state.json`.
 | `-` / `=`          | resize        |
 | `0`                | straighten    |
 | double-click/Enter | write on it   |
+| arrow keys         | slide crop    |
 | Ctrl+V             | paste another |
 | Delete             | remove        |
 | right-click        | menu          |

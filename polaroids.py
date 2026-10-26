@@ -194,8 +194,10 @@ class Polaroid(Gtk.Window):
         self.y = int(entry.get("y", 100))
         self.caption = str(entry.get("caption", ""))
         self.square = bool(entry.get("square", True))
+        self.pan = float(entry.get("pan", 0.5))        # 0 = keep top/left edge, 1 = bottom/right
+        self.turn = int(entry.get("turn", 0)) % 360   # photo turned inside the frame, 90 deg steps
         self.editing = None            # caption text before editing began, while editing
-        self.pixbuf = load_pixbuf(IMAGES / self.image)
+        self.source = load_pixbuf(IMAGES / self.image)
         self.update_crop()
         self.drag = None
         self.cur_w = self.cur_h = 0
@@ -257,17 +259,28 @@ class Polaroid(Gtk.Window):
 
     # ---- geometry -------------------------------------------------------
     def update_crop(self):
-        """Visible part of the pixbuf: a centred square, or the whole image."""
+        """Turn the source, then pick the visible part: a square slid by `pan`, or everything."""
+        rot = {0: GdkPixbuf.PixbufRotation.NONE, 90: GdkPixbuf.PixbufRotation.CLOCKWISE,
+               180: GdkPixbuf.PixbufRotation.UPSIDEDOWN, 270: GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE}
+        self.pixbuf = self.source.rotate_simple(rot.get(self.turn, GdkPixbuf.PixbufRotation.NONE))
         w, h = self.pixbuf.get_width(), self.pixbuf.get_height()
         if self.square:
             side = min(w, h)
-            self.crop = ((w - side) // 2, (h - side) // 2, side, side)
+            self.crop = (round((w - side) * self.pan), round((h - side) * self.pan), side, side)
         else:
             self.crop = (0, 0, w, h)
         self.pix_w, self.pix_h = self.crop[2], self.crop[3]
 
-    def set_square(self, square):
-        self.square = bool(square)
+    def landscape(self):
+        return self.pixbuf.get_width() > self.pixbuf.get_height()
+
+    def set_fit(self, square=None, pan=None, turn=None):
+        if square is not None:
+            self.square = bool(square)
+        if pan is not None:
+            self.pan = max(0.0, min(1.0, pan))
+        if turn is not None:
+            self.turn = turn % 360
         self.update_crop()
         self.apply_geometry()
 
@@ -327,7 +340,8 @@ class Polaroid(Gtk.Window):
     def to_entry(self):
         return {"id": self.id, "image": self.image, "x": self.x, "y": self.y,
                 "width": round(self.width, 1), "angle": round(self.angle, 2),
-                "caption": self.caption, "square": self.square}
+                "caption": self.caption, "square": self.square,
+                "pan": round(self.pan, 3), "turn": self.turn}
 
     # ---- drawing --------------------------------------------------------
     def on_draw(self, _widget, cr):
@@ -568,6 +582,10 @@ class Polaroid(Gtk.Window):
             self.set_width(self.width / 1.06)
         elif k == "0":
             self.set_angle(0)
+        elif k in ("Left", "Up") and self.square:
+            self.set_fit(pan=self.pan - 0.05)
+        elif k in ("Right", "Down") and self.square:
+            self.set_fit(pan=self.pan + 0.05)
         elif k in ("Return", "KP_Enter", "F2"):
             self.start_edit()
         else:
@@ -592,12 +610,37 @@ class Polaroid(Gtk.Window):
             None,
             ("Write on it\u2026", lambda *_: self.start_edit()),
             ("Clear writing", lambda *_: self.set_caption("")),
-            ("Square crop", lambda mi: self.set_square(mi.get_active()), self.square),
+            None,
+            ("Fit", self.fit_menu_items()),
             None,
             ("Paste from clipboard", lambda *_: self.manager.paste_clipboard()),
             ("Remove", lambda *_: self.manager.remove(self)),
         ])
         menu.popup_at_pointer(ev)
+
+
+    def fit_menu_items(self):
+        """Radio items: whole image or square, which edge to keep, and how the photo is turned."""
+        def radio(label, active, **fit):
+            return (label, lambda mi: mi.get_active() and self.set_fit(**fit), active, "radio")
+
+        sq, pan = self.square, self.pan
+        if self.landscape():
+            edges = (("Keep left", 0.0), ("Keep middle", 0.5), ("Keep right", 1.0))
+        else:
+            edges = (("Keep top", 0.0), ("Keep middle", 0.5), ("Keep bottom", 1.0))
+        items = [radio("Whole image", not sq, square=False)]
+        for label, p in edges:
+            items.append(radio(label, sq and abs(pan - p) < 0.025, square=True, pan=p))
+        if sq and all(abs(pan - p) >= 0.025 for _, p in edges):
+            items.append(radio(f"Custom ({pan:.0%})", True, square=True))
+        items.append(None)
+        for label, t in (("Upright", 0), ("On its side (right)", 90),
+                         ("Upside down", 180), ("On its side (left)", 270)):
+            items.append(radio(label, self.turn == t, turn=t))
+        items.append(None)
+        items.append(("Arrow keys slide the crop", None))
+        return items
 
 
 def build_menu(items):
@@ -606,10 +649,17 @@ def build_menu(items):
         if item is None:
             menu.append(Gtk.SeparatorMenuItem())
             continue
-        if len(item) > 2:
+        if isinstance(item[1], list):               # submenu
+            mi = Gtk.MenuItem(label=item[0])
+            mi.set_submenu(build_menu(item[1]))
+        elif len(item) > 2:                         # check / radio item
             mi = Gtk.CheckMenuItem(label=item[0])
+            mi.set_draw_as_radio(len(item) > 3)
             mi.set_active(bool(item[2]))
             mi.connect("toggled", item[1])
+        elif item[1] is None:                       # plain hint
+            mi = Gtk.MenuItem(label=item[0])
+            mi.set_sensitive(False)
         else:
             mi = Gtk.MenuItem(label=item[0])
             mi.connect("activate", item[1])
