@@ -72,6 +72,7 @@ PAPER = (0.98, 0.97, 0.94)
 INK = (0.12, 0.12, 0.24)              # dark blue marker
 CAPTION_FONT = "Caveat, Permanent Marker, Z003, Comic Sans MS, cursive"
 CAPTION_SIZE = 0.125                  # caption font size as a fraction of photo width
+EMOJI_SCALE = 0.68                    # emoji come from a fallback font and dwarf the handwriting
 FONT_DIR = Path(__file__).resolve().parent / "fonts"
 IMAGE_TARGETS = ("image/png", "image/jpeg", "image/bmp", "image/tiff", "image/webp", "image/gif")
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")
@@ -113,6 +114,31 @@ def register_fonts():
             fc.FcConfigAppFontAddFile(fc.FcConfigGetCurrent(), str(f).encode())
     except Exception as e:
         log("bundled fonts unavailable:", e)
+
+
+def is_emoji(ch):
+    o = ord(ch)
+    return (o >= 0x1F000 or 0x2600 <= o <= 0x27BF or 0x2B00 <= o <= 0x2BFF
+            or o in (0xFE0F, 0x200D, 0x20E3) or 0x1F3FB <= o <= 0x1F3FF)
+
+
+def emoji_attrs(text, scale):
+    """Pango attributes shrinking every emoji run in text by `scale`."""
+    attrs = Pango.AttrList()
+    pos = 0
+    start = None
+    for ch in text + "\x00":
+        n = len(ch.encode("utf-8"))
+        if is_emoji(ch):
+            if start is None:
+                start = pos
+        elif start is not None:
+            a = Pango.attr_scale_new(scale)
+            a.start_index, a.end_index = start, pos
+            attrs.insert(a)
+            start = None
+        pos += n
+    return attrs
 
 
 def rounded_rect(cr, x, y, w, h, r):
@@ -433,6 +459,7 @@ class Polaroid(Gtk.Window):
         layout.set_wrap(Pango.WrapMode.WORD_CHAR)
         layout.set_alignment(Pango.Alignment.CENTER)
         layout.set_text(text, -1)
+        layout.set_attributes(emoji_attrs(text, EMOJI_SCALE))
         size = max(8.0, self.width * CAPTION_SIZE)
         while True:
             font.set_absolute_size(size * Pango.SCALE)
@@ -692,6 +719,7 @@ class Polaroid(Gtk.Window):
     # ---- interaction ----------------------------------------------------
     def on_press(self, _w, ev):
         debug("press", ev.button, ev.type, ev.x_root, ev.y_root)
+        self.manager.raised(self)
         if ev.button == 1 and ev.type == Gdk.EventType._2BUTTON_PRESS:
             self.drag = None
             self.start_edit()
@@ -920,6 +948,7 @@ class Manager:
             except Exception as e:
                 log("could not restore", entry.get("image"), e)
         log(f"restored {len(self.polaroids)} polaroid(s)")
+        GLib.idle_add(lambda: self.restack() or False)
 
     def save_soon(self):
         if self.save_pending is None:
@@ -964,6 +993,19 @@ class Manager:
             return False
         self.add_pixbuf(pb)
         return True
+
+    def raised(self, p):
+        """Remember that p is now on top: state.json is kept in stacking order, bottom first."""
+        if p.id in self.polaroids and next(reversed(self.polaroids)) != p.id:
+            self.polaroids[p.id] = self.polaroids.pop(p.id)
+            self.save_soon()
+
+    def restack(self):
+        """Raise every polaroid in saved order so the stack survives a restart."""
+        for p in self.polaroids.values():
+            win = p.get_window()
+            if win is not None:
+                win.raise_()
 
     def on_desktop_windows_changed(self, xids):
         self.desktop_window = xids[0] if xids else None

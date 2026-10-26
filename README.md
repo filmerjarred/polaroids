@@ -57,7 +57,8 @@ words, Home/End go to the line ends), Shift+arrows or a click-and-drag on the
 text selects, and Ctrl+A / C / X / V select all, copy, cut and paste.
 Backspace and Delete remove a character, a word with Ctrl, or the selection.
 **Enter** finishes, **Shift+Enter** starts a new line, **Esc** cancels.
-Clicking away also finishes. Captions are saved in `state.json`.
+Clicking away also finishes. Captions are saved in `state.json`. Emoji are
+drawn a little smaller than the letters so they match the handwriting.
 
 ## Data
 
@@ -94,5 +95,5 @@ to log input events.
 ## Known limits
 
 - Polaroids survive "Show desktop" because each is marked transient for nemo-desktop's window, which Muffin exempts. If nemo-desktop restarts they are re-parented automatically.
-- Clicking a polaroid gives it keyboard focus like any other window.
+- Clicking a polaroid gives it keyboard focus like any other window, and brings it to the top of the pile. That order is saved and restored.
 - Nemo's own Ctrl+V on the desktop is bypassed only when the clipboard holds an image.
