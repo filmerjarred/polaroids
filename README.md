@@ -95,5 +95,5 @@ to log input events.
 ## Known limits
 
 - Polaroids survive "Show desktop" because each is marked transient for nemo-desktop's window, which Muffin exempts. If nemo-desktop restarts they are re-parented automatically.
-- Clicking a polaroid gives it keyboard focus like any other window, and brings it to the top of the pile. That order is saved and restored.
+- Clicking a polaroid gives it keyboard focus like any other window, and brings it to the top of the pile. That order is saved and restored. Right-click, **Always on top** keeps a polaroid above the other polaroids regardless (it still sits under normal apps).
 - Nemo's own Ctrl+V on the desktop is bypassed only when the clipboard holds an image.

@@ -222,6 +222,7 @@ class Polaroid(Gtk.Window):
         self.square = bool(entry.get("square", True))
         self.pan = float(entry.get("pan", 0.5))        # 0 = keep top/left edge, 1 = bottom/right
         self.turn = int(entry.get("turn", 0)) % 360   # photo turned inside the frame, 90 deg steps
+        self.pinned = bool(entry.get("pinned", False))  # always above the other polaroids
         self.editing = None            # caption text before editing began, while editing
         self.cursor = 0                # caret position (characters) while editing
         self.anchor = None             # other end of the selection, or None
@@ -371,7 +372,7 @@ class Polaroid(Gtk.Window):
         return {"id": self.id, "image": self.image, "x": self.x, "y": self.y,
                 "width": round(self.width, 1), "angle": round(self.angle, 2),
                 "caption": self.caption, "square": self.square,
-                "pan": round(self.pan, 3), "turn": self.turn}
+                "pan": round(self.pan, 3), "turn": self.turn, "pinned": self.pinned}
 
     # ---- drawing --------------------------------------------------------
     def on_draw(self, _widget, cr):
@@ -817,12 +818,18 @@ class Polaroid(Gtk.Window):
             ("Clear writing", lambda *_: self.set_caption("")),
             None,
             ("Fit", self.fit_menu_items()),
+            ("Always on top", lambda mi: self.set_pinned(mi.get_active()), self.pinned),
             None,
             ("Paste from clipboard", lambda *_: self.manager.paste_clipboard()),
             ("Remove", lambda *_: self.manager.remove(self)),
         ])
         menu.popup_at_pointer(ev)
 
+
+    def set_pinned(self, pinned):
+        self.pinned = bool(pinned)
+        self.manager.raised(self)
+        self.manager.restack()
 
     def fit_menu_items(self):
         """Radio items: whole image or square, which edge to keep, and how the photo is turned."""
@@ -995,14 +1002,24 @@ class Manager:
         return True
 
     def raised(self, p):
-        """Remember that p is now on top: state.json is kept in stacking order, bottom first."""
+        """Remember that p was clicked: state.json is kept in click order, oldest first.
+
+        The window manager raises the clicked window itself; pinned polaroids are
+        then put back above everything on the next idle.
+        """
         if p.id in self.polaroids and next(reversed(self.polaroids)) != p.id:
             self.polaroids[p.id] = self.polaroids.pop(p.id)
             self.save_soon()
+        if any(q.pinned for q in self.polaroids.values()):
+            GLib.idle_add(lambda: self.restack() or False)
+
+    def stacking_order(self):
+        ps = list(self.polaroids.values())
+        return [p for p in ps if not p.pinned] + [p for p in ps if p.pinned]
 
     def restack(self):
-        """Raise every polaroid in saved order so the stack survives a restart."""
-        for p in self.polaroids.values():
+        """Raise every polaroid in order: click order, with pinned ones on top."""
+        for p in self.stacking_order():
             win = p.get_window()
             if win is not None:
                 win.raise_()
