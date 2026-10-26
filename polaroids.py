@@ -16,6 +16,7 @@ Controls on a polaroid:
   scroll              resize
   shift + scroll      rotate
   [ / ]  or  - / =    rotate / resize from the keyboard
+  double-click        write on it (Enter finishes, Esc cancels)
   Ctrl+V              paste another polaroid
   Delete              remove
   right-click         menu
@@ -35,14 +36,19 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
+import ctypes
+import ctypes.util
+
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("GdkX11", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
 import cairo  # noqa: E402
-from gi.repository import Gdk, GdkPixbuf, GdkX11, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GdkX11, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from x11grab import DesktopKeyGrab  # noqa: E402
@@ -54,13 +60,19 @@ TRASH = DATA_DIR / "trash"
 STATE = DATA_DIR / "state.json"
 LOCK = DATA_DIR / "lock"
 
-FRAME = 0.06        # side/top border as a fraction of photo width
-BOTTOM = 0.22       # bottom border as a fraction of photo width
-MARGIN = 14         # transparent margin around the frame for the drop shadow
+# Real Polaroid (SX-70 / 600) proportions: a 3.1" square image on a 3.5" x 4.2" card.
+FRAME = 0.065       # side/top border as a fraction of photo width
+BOTTOM = 0.29       # bottom border as a fraction of photo width
+CORNER = 0.012      # card corner radius as a fraction of photo width
+MARGIN = 16         # transparent margin around the frame for the drop shadow
 MAX_SOURCE = 1600   # cap decoded image size (longest edge) to keep redraws cheap
 DEFAULT_WIDTH = 280
 MIN_WIDTH, MAX_WIDTH = 60, 2400
-PAPER = (0.985, 0.975, 0.945)
+PAPER = (0.98, 0.97, 0.94)
+INK = (0.12, 0.12, 0.24)              # dark blue marker
+CAPTION_FONT = "Caveat, Permanent Marker, Z003, Comic Sans MS, cursive"
+CAPTION_SIZE = 0.125                  # caption font size as a fraction of photo width
+FONT_DIR = Path(__file__).resolve().parent / "fonts"
 IMAGE_TARGETS = ("image/png", "image/jpeg", "image/bmp", "image/tiff", "image/webp", "image/gif")
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")
 
@@ -88,6 +100,29 @@ def shrink_pixbuf(pb):
         s = MAX_SOURCE / longest
         pb = pb.scale_simple(max(1, int(w * s)), max(1, int(h * s)), GdkPixbuf.InterpType.BILINEAR)
     return pb
+
+
+def register_fonts():
+    """Make the bundled handwriting font visible to Pango without installing it."""
+    try:
+        lib = ctypes.util.find_library("fontconfig")
+        fc = ctypes.CDLL(lib)
+        fc.FcConfigGetCurrent.restype = ctypes.c_void_p
+        fc.FcConfigAppFontAddFile.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        for f in sorted(FONT_DIR.glob("*.[to]tf")):
+            fc.FcConfigAppFontAddFile(fc.FcConfigGetCurrent(), str(f).encode())
+    except Exception as e:
+        log("bundled fonts unavailable:", e)
+
+
+def rounded_rect(cr, x, y, w, h, r):
+    r = max(0.0, min(r, w / 2, h / 2))
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
 
 
 def polygon_region(points):
@@ -157,8 +192,11 @@ class Polaroid(Gtk.Window):
         self.angle = float(entry.get("angle", 0.0))
         self.x = int(entry.get("x", 100))
         self.y = int(entry.get("y", 100))
+        self.caption = str(entry.get("caption", ""))
+        self.square = bool(entry.get("square", True))
+        self.editing = None            # caption text before editing began, while editing
         self.pixbuf = load_pixbuf(IMAGES / self.image)
-        self.pix_w, self.pix_h = self.pixbuf.get_width(), self.pixbuf.get_height()
+        self.update_crop()
         self.drag = None
         self.cur_w = self.cur_h = 0
         self.desktop_parent = None
@@ -192,6 +230,7 @@ class Polaroid(Gtk.Window):
         self.area.connect("motion-notify-event", self.on_motion)
         self.area.connect("scroll-event", self.on_scroll)
         self.connect("key-press-event", self.on_key)
+        self.connect("focus-out-event", self.on_focus_out)
         self.connect("configure-event", self.on_configure)
         self.connect("realize", lambda *_: self.update_shape())
         self.add(self.area)
@@ -217,6 +256,21 @@ class Polaroid(Gtk.Window):
             log("could not set desktop parent:", e)
 
     # ---- geometry -------------------------------------------------------
+    def update_crop(self):
+        """Visible part of the pixbuf: a centred square, or the whole image."""
+        w, h = self.pixbuf.get_width(), self.pixbuf.get_height()
+        if self.square:
+            side = min(w, h)
+            self.crop = ((w - side) // 2, (h - side) // 2, side, side)
+        else:
+            self.crop = (0, 0, w, h)
+        self.pix_w, self.pix_h = self.crop[2], self.crop[3]
+
+    def set_square(self, square):
+        self.square = bool(square)
+        self.update_crop()
+        self.apply_geometry()
+
     def frame_size(self):
         w = self.width
         h = w * self.pix_h / self.pix_w
@@ -272,7 +326,8 @@ class Polaroid(Gtk.Window):
 
     def to_entry(self):
         return {"id": self.id, "image": self.image, "x": self.x, "y": self.y,
-                "width": round(self.width, 1), "angle": round(self.angle, 2)}
+                "width": round(self.width, 1), "angle": round(self.angle, 2),
+                "caption": self.caption, "square": self.square}
 
     # ---- drawing --------------------------------------------------------
     def on_draw(self, _widget, cr):
@@ -282,34 +337,184 @@ class Polaroid(Gtk.Window):
         cr.set_operator(cairo.OPERATOR_OVER)
 
         fw, fh, b = self.frame_size()
+        w = self.width
+        r = w * CORNER
         cr.translate(self.cur_w / 2, self.cur_h / 2)
         cr.rotate(math.radians(self.angle))
+        x0, y0 = -fw / 2, -fh / 2
 
-        # soft drop shadow: stacked translucent rects, offset down-right
-        for i in range(8, 0, -1):
-            cr.set_source_rgba(0, 0, 0, 0.035)
-            cr.rectangle(-fw / 2 - i + 3, -fh / 2 - i + 5, fw + 2 * i, fh + 2 * i)
+        # soft drop shadow: stacked translucent rounded rects, offset down-right
+        for i in range(10, 0, -1):
+            cr.set_source_rgba(0, 0, 0, 0.03)
+            rounded_rect(cr, x0 - i + 3, y0 - i + 6, fw + 2 * i, fh + 2 * i, r + i)
             cr.fill()
 
-        cr.set_source_rgb(*PAPER)
-        cr.rectangle(-fw / 2, -fh / 2, fw, fh)
+        # the card: warm white with a faint diagonal gradient, hairline edge
+        paper = cairo.LinearGradient(x0, y0, x0 + fw, y0 + fh)
+        paper.add_color_stop_rgb(0, *[c + 0.015 for c in PAPER])
+        paper.add_color_stop_rgb(1, *[c - 0.03 for c in PAPER])
+        rounded_rect(cr, x0, y0, fw, fh, r)
+        cr.set_source(paper)
+        cr.fill_preserve()
+        cr.set_source_rgba(0, 0, 0, 0.10)
+        cr.set_line_width(1)
+        cr.stroke()
+
+        # the photo, sunk into the card: dark rim, image, inner shadow, slight vignette
+        px, py = x0 + b, y0 + b
+        pw, ph = w, w * self.pix_h / self.pix_w
+        cr.set_source_rgb(0.10, 0.09, 0.09)
+        cr.rectangle(px - 1, py - 1, pw + 2, ph + 2)
         cr.fill()
 
         cr.save()
-        cr.translate(-fw / 2 + b, -fh / 2 + b)
-        scale = self.width / self.pix_w
+        cr.rectangle(px, py, pw, ph)
+        cr.clip()
+        cx0, cy0, cw, ch = self.crop
+        scale = pw / cw
+        cr.translate(px, py)
         cr.scale(scale, scale)
-        Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
+        Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, -cx0, -cy0)
         cr.get_source().set_filter(cairo.FILTER_GOOD)
-        cr.rectangle(0, 0, self.pix_w, self.pix_h)
+        cr.paint()
+        cr.restore()
+
+        cr.save()
+        cr.rectangle(px, py, pw, ph)
+        cr.clip()
+        inset = max(2.0, w * 0.02)
+        top = cairo.LinearGradient(px, py, px, py + inset * 2)
+        top.add_color_stop_rgba(0, 0, 0, 0, 0.35)
+        top.add_color_stop_rgba(1, 0, 0, 0, 0)
+        cr.set_source(top)
+        cr.rectangle(px, py, pw, inset * 2)
+        cr.fill()
+        left = cairo.LinearGradient(px, py, px + inset, py)
+        left.add_color_stop_rgba(0, 0, 0, 0, 0.18)
+        left.add_color_stop_rgba(1, 0, 0, 0, 0)
+        cr.set_source(left)
+        cr.rectangle(px, py, inset, ph)
+        cr.fill()
+        vignette = cairo.RadialGradient(px + pw / 2, py + ph / 2, min(pw, ph) * 0.45,
+                                        px + pw / 2, py + ph / 2, max(pw, ph) * 0.75)
+        vignette.add_color_stop_rgba(0, 0, 0, 0, 0)
+        vignette.add_color_stop_rgba(1, 0, 0, 0, 0.16)
+        cr.set_source(vignette)
+        cr.rectangle(px, py, pw, ph)
         cr.fill()
         cr.restore()
+
+        self.draw_caption(cr, x0 + b, py + ph, w, fh - b - ph)
+        return True
+
+    def caption_layout(self, cr, width):
+        layout = PangoCairo.create_layout(cr)
+        font = Pango.FontDescription.from_string(CAPTION_FONT)
+        font.set_absolute_size(max(8.0, self.width * CAPTION_SIZE) * Pango.SCALE)
+        layout.set_font_description(font)
+        layout.set_width(int(width * Pango.SCALE))
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        layout.set_alignment(Pango.Alignment.CENTER)
+        layout.set_text(self.caption, -1)
+        return layout
+
+    def draw_caption(self, cr, x, y, width, height):
+        """Handwriting in the bottom band; a caret while editing, a hint when empty."""
+        editing = self.editing is not None
+        text = self.caption
+        if not text and not editing:
+            return
+        cr.save()
+        cr.rectangle(x, y, width, height)
+        cr.clip()
+        pad = width * 0.04
+        layout = self.caption_layout(cr, width - 2 * pad)
+        if not text:
+            layout.set_text("write something\u2026", -1)
+        _ink, logical = layout.get_pixel_extents()
+        ty = y + max(0.0, (height - logical.height) / 2) - logical.y
+        cr.move_to(x + pad, ty)
+        if text:
+            cr.set_source_rgba(*INK, 0.92)
+        else:
+            cr.set_source_rgba(0, 0, 0, 0.22)
+        PangoCairo.show_layout(cr, layout)
+        if editing:
+            strong, _weak = layout.get_cursor_pos(len(text.encode("utf-8")))
+            cx = x + pad + strong.x / Pango.SCALE
+            cy = ty + strong.y / Pango.SCALE
+            ch = strong.height / Pango.SCALE
+            if not text:
+                cx = x + width / 2 - logical.width / 2 - 2   # caret ahead of the hint
+            cr.set_source_rgba(*INK, 0.9)
+            cr.set_line_width(max(1.0, self.width * 0.005))
+            cr.move_to(cx, cy)
+            cr.line_to(cx, cy + ch)
+            cr.stroke()
+        cr.restore()
+
+    # ---- writing --------------------------------------------------------
+    def start_edit(self):
+        if self.editing is None:
+            self.editing = self.caption
+        if not self.is_active():
+            self.present_with_time(Gtk.get_current_event_time())
+        self.queue_draw()
+
+    def on_focus_out(self, *_):
+        debug("focus out", self.id)
+        # Focus bounces briefly on click/present; only commit if it really went elsewhere.
+        GLib.timeout_add(150, lambda: self.is_active() or self.finish_edit())
+        return False
+
+    def finish_edit(self, cancel=False):
+        if self.editing is None:
+            return False
+        if cancel:
+            self.caption = self.editing
+        self.editing = None
+        self.caption = self.caption.strip()
+        self.queue_draw()
+        self.manager.save_soon()
+        return False
+
+    def set_caption(self, text):
+        self.caption = text
+        self.queue_draw()
+        self.manager.save_soon()
+
+    def edit_key(self, ev, k, ctrl):
+        """Key handling while writing. Returns True when the key was consumed."""
+        if k == "Escape":
+            self.finish_edit(cancel=True)
+        elif k in ("Return", "KP_Enter") and not (ev.state & Gdk.ModifierType.SHIFT_MASK):
+            self.finish_edit()
+        elif k in ("Return", "KP_Enter"):
+            self.set_caption(self.caption + "\n")
+        elif k == "BackSpace":
+            if ctrl:
+                self.set_caption(self.caption.rstrip().rsplit(" ", 1)[0] if " " in self.caption.rstrip() else "")
+            else:
+                self.set_caption(self.caption[:-1])
+        elif ctrl and k in ("v", "V"):
+            text = self.manager.clipboard.wait_for_text()
+            if text:
+                self.set_caption(self.caption + text)
+        elif ctrl and k in ("a", "A", "u", "U"):
+            self.set_caption("")
+        elif not ctrl:
+            ch = Gdk.keyval_to_unicode(ev.keyval)
+            if ch and (chr(ch).isprintable() or ch == 0x20):
+                self.set_caption(self.caption + chr(ch))
         return True
 
     # ---- interaction ----------------------------------------------------
     def on_press(self, _w, ev):
-        debug("press", ev.button, ev.x_root, ev.y_root)
-        if ev.button == 1:
+        debug("press", ev.button, ev.type, ev.x_root, ev.y_root)
+        if ev.button == 1 and ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.drag = None
+            self.start_edit()
+        elif ev.button == 1:
             self.drag = (ev.x_root - self.x, ev.y_root - self.y)
         elif ev.button == 3:
             self.popup_menu(ev)
@@ -343,6 +548,8 @@ class Polaroid(Gtk.Window):
         k = Gdk.keyval_name(ev.keyval)
         ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
         debug("key", k, "ctrl" if ctrl else "")
+        if self.editing is not None:
+            return self.edit_key(ev, k, ctrl)
         if ctrl and k in ("v", "V"):
             self.manager.paste_clipboard()
         elif k == "Delete":
@@ -357,6 +564,8 @@ class Polaroid(Gtk.Window):
             self.set_width(self.width / 1.06)
         elif k == "0":
             self.set_angle(0)
+        elif k in ("Return", "KP_Enter", "F2"):
+            self.start_edit()
         else:
             return False
         return True
@@ -377,6 +586,10 @@ class Polaroid(Gtk.Window):
             ("Bigger", lambda *_: self.set_width(self.width * 1.25)),
             ("Smaller", lambda *_: self.set_width(self.width / 1.25)),
             None,
+            ("Write on it\u2026", lambda *_: self.start_edit()),
+            ("Clear writing", lambda *_: self.set_caption("")),
+            ("Square crop", lambda mi: self.set_square(mi.get_active()), self.square),
+            None,
             ("Paste from clipboard", lambda *_: self.manager.paste_clipboard()),
             ("Remove", lambda *_: self.manager.remove(self)),
         ])
@@ -389,8 +602,13 @@ def build_menu(items):
         if item is None:
             menu.append(Gtk.SeparatorMenuItem())
             continue
-        mi = Gtk.MenuItem(label=item[0])
-        mi.connect("activate", item[1])
+        if len(item) > 2:
+            mi = Gtk.CheckMenuItem(label=item[0])
+            mi.set_active(bool(item[2]))
+            mi.connect("toggled", item[1])
+        else:
+            mi = Gtk.MenuItem(label=item[0])
+            mi.connect("activate", item[1])
         menu.append(mi)
     menu.show_all()
     return menu
@@ -644,6 +862,7 @@ def main(argv):
         return 0
 
     Gdk.set_program_class("Polaroids")
+    register_fonts()
     manager = Manager()
     GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGUSR1, lambda *_: manager.restart() or True)
     for sig in (signal.SIGTERM, signal.SIGINT):

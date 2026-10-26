@@ -3,7 +3,8 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p ~/.config/systemd/user ~/.config/autostart
-cp "$here/polaroids.service" ~/.config/systemd/user/polaroids.service
+sed -e "s|__HERE__|$here|g" -e "s|__HOME__|$HOME|g" "$here/polaroids.service" \
+    > ~/.config/systemd/user/polaroids.service
 cp "$here/polaroids.desktop" ~/.config/autostart/polaroids.desktop
 systemctl --user daemon-reload
 if [[ -n "${DISPLAY:-}" ]]; then
