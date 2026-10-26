@@ -407,16 +407,22 @@ class Polaroid(Gtk.Window):
         self.draw_caption(cr, x0 + b, py + ph, w, fh - b - ph)
         return True
 
-    def caption_layout(self, cr, width):
+    def caption_layout(self, cr, width, height, text):
+        """Lay out the caption at the normal size, shrinking it until it fits the strip."""
         layout = PangoCairo.create_layout(cr)
         font = Pango.FontDescription.from_string(CAPTION_FONT)
-        font.set_absolute_size(max(8.0, self.width * CAPTION_SIZE) * Pango.SCALE)
-        layout.set_font_description(font)
         layout.set_width(int(width * Pango.SCALE))
         layout.set_wrap(Pango.WrapMode.WORD_CHAR)
         layout.set_alignment(Pango.Alignment.CENTER)
-        layout.set_text(self.caption, -1)
-        return layout
+        layout.set_text(text, -1)
+        size = max(8.0, self.width * CAPTION_SIZE)
+        while True:
+            font.set_absolute_size(size * Pango.SCALE)
+            layout.set_font_description(font)
+            _ink, logical = layout.get_pixel_extents()
+            if logical.height <= height or size <= 4.0:
+                return layout
+            size = max(4.0, size * 0.9)
 
     def draw_caption(self, cr, x, y, width, height):
         """Handwriting in the bottom band; a caret while editing, a hint when empty."""
@@ -428,9 +434,7 @@ class Polaroid(Gtk.Window):
         cr.rectangle(x, y, width, height)
         cr.clip()
         pad = width * 0.04
-        layout = self.caption_layout(cr, width - 2 * pad)
-        if not text:
-            layout.set_text("write something\u2026", -1)
+        layout = self.caption_layout(cr, width - 2 * pad, height - 2 * pad, text or "write something\u2026")
         _ink, logical = layout.get_pixel_extents()
         ty = y + max(0.0, (height - logical.height) / 2) - logical.y
         cr.move_to(x + pad, ty)
