@@ -197,6 +197,10 @@ class Polaroid(Gtk.Window):
         self.pan = float(entry.get("pan", 0.5))        # 0 = keep top/left edge, 1 = bottom/right
         self.turn = int(entry.get("turn", 0)) % 360   # photo turned inside the frame, 90 deg steps
         self.editing = None            # caption text before editing began, while editing
+        self.cursor = 0                # caret position (characters) while editing
+        self.anchor = None             # other end of the selection, or None
+        self.sel_drag = False          # mouse is dragging a selection
+        self.band = None               # (x, y, w, h, layout, ox, oy) of the caption strip, frame coords
         self.source = load_pixbuf(IMAGES / self.image)
         self.update_crop()
         self.drag = None
@@ -450,17 +454,24 @@ class Polaroid(Gtk.Window):
         pad = width * 0.04
         layout = self.caption_layout(cr, width - 2 * pad, height - 2 * pad, text or "write something\u2026")
         _ink, logical = layout.get_pixel_extents()
-        ty = y + max(0.0, (height - logical.height) / 2) - logical.y
-        cr.move_to(x + pad, ty)
+        ox, oy = x + pad, y + max(0.0, (height - logical.height) / 2) - logical.y
+        self.band = (x, y, width, height, layout, ox, oy)
+        sel = self.selection()
+        if editing and sel and text:
+            cr.set_source_rgba(0.45, 0.6, 0.95, 0.4)
+            for rx, ry, rw, rh in self.selection_rects(layout, *sel):
+                cr.rectangle(ox + rx, oy + ry, rw, rh)
+            cr.fill()
+        cr.move_to(ox, oy)
         if text:
             cr.set_source_rgba(*INK, 0.92)
         else:
             cr.set_source_rgba(0, 0, 0, 0.22)
         PangoCairo.show_layout(cr, layout)
         if editing:
-            strong, _weak = layout.get_cursor_pos(len(text.encode("utf-8")))
-            cx = x + pad + strong.x / Pango.SCALE
-            cy = ty + strong.y / Pango.SCALE
+            strong, _weak = layout.get_cursor_pos(self.byte_index(self.cursor))
+            cx = ox + strong.x / Pango.SCALE
+            cy = oy + strong.y / Pango.SCALE
             ch = strong.height / Pango.SCALE
             if not text:
                 cx = x + width / 2 - logical.width / 2 - 2   # caret ahead of the hint
@@ -471,10 +482,30 @@ class Polaroid(Gtk.Window):
             cr.stroke()
         cr.restore()
 
+    def selection_rects(self, layout, start, end):
+        """Pixel rectangles (layout coords) covering characters [start, end)."""
+        bs, be = self.byte_index(start), self.byte_index(end)
+        rects = []
+        it = layout.get_iter()
+        while True:
+            line = it.get_line_readonly()
+            ls, le = line.start_index, line.start_index + line.length
+            _ink, lg = it.get_line_extents()
+            a, b = max(bs, ls), min(be, le)
+            if a < b or (a == b and ls <= bs < le and bs == be):
+                x1 = lg.x if a <= ls else layout.index_to_pos(a).x
+                x2 = lg.x + lg.width if b >= le else layout.index_to_pos(b).x
+                rects.append((x1 / Pango.SCALE, lg.y / Pango.SCALE,
+                              max(2.0, (x2 - x1) / Pango.SCALE), lg.height / Pango.SCALE))
+            if not it.next_line():
+                break
+        return rects
+
     # ---- writing --------------------------------------------------------
     def start_edit(self):
         if self.editing is None:
             self.editing = self.caption
+            self.cursor, self.anchor = len(self.caption), None
         if not self.is_active():
             self.present_with_time(Gtk.get_current_event_time())
         self.queue_draw()
@@ -491,39 +522,171 @@ class Polaroid(Gtk.Window):
         if cancel:
             self.caption = self.editing
         self.editing = None
+        self.anchor = None
+        self.sel_drag = False
         self.caption = self.caption.strip()
+        self.cursor = len(self.caption)
         self.queue_draw()
         self.manager.save_soon()
         return False
 
-    def set_caption(self, text):
+    def set_caption(self, text, cursor=None):
         self.caption = text
+        if cursor is not None:
+            self.cursor = cursor
+        self.cursor = max(0, min(len(text), self.cursor))
         self.queue_draw()
         self.manager.save_soon()
 
+    # -- text model: positions are character indices, Pango wants bytes --
+    def byte_index(self, i):
+        return len(self.caption[:i].encode("utf-8"))
+
+    def char_index(self, b):
+        return len(self.caption.encode("utf-8")[:b].decode("utf-8", "ignore"))
+
+    def selection(self):
+        if self.anchor is None or self.anchor == self.cursor:
+            return None
+        return min(self.anchor, self.cursor), max(self.anchor, self.cursor)
+
+    def replace_selection(self, text):
+        """Insert text at the caret, replacing any selection."""
+        sel = self.selection() or (self.cursor, self.cursor)
+        self.anchor = None
+        self.set_caption(self.caption[:sel[0]] + text + self.caption[sel[1]:], sel[0] + len(text))
+
+    def word_left(self, i):
+        t = self.caption
+        while i > 0 and not t[i - 1].isalnum():
+            i -= 1
+        while i > 0 and t[i - 1].isalnum():
+            i -= 1
+        return i
+
+    def word_right(self, i):
+        t = self.caption
+        while i < len(t) and not t[i].isalnum():
+            i += 1
+        while i < len(t) and t[i].isalnum():
+            i += 1
+        return i
+
+    def line_bounds(self, i):
+        """Start and end (character indices) of the visual line holding position i."""
+        layout = self.band[4] if self.band else None
+        if layout is None or not self.caption:
+            return 0, len(self.caption)
+        line_no, _x = layout.index_to_line_x(self.byte_index(i), False)
+        line = layout.get_line_readonly(line_no)
+        end = line.start_index + line.length
+        text = self.caption
+        s, e = self.char_index(line.start_index), self.char_index(end)
+        if e > s and e <= len(text) and text[e - 1] == "\n":
+            e -= 1
+        elif e < len(text) and text[e - 1:e] == " " and line_no < layout.get_line_count() - 1:
+            e -= 1                     # wrapped lines own the trailing space; caret sits before it
+        return s, e
+
+    def line_move(self, i, direction):
+        """Position on the line above (-1) or below (+1), keeping the caret's x."""
+        layout = self.band[4] if self.band else None
+        if layout is None or not self.caption:
+            return i
+        strong, _weak = layout.get_cursor_pos(self.byte_index(i))
+        line_no, _x = layout.index_to_line_x(self.byte_index(i), False)
+        target = line_no + direction
+        if target < 0:
+            return 0
+        if target >= layout.get_line_count():
+            return len(self.caption)
+        it = layout.get_iter()
+        for _ in range(target):
+            it.next_line()
+        _ink, lg = it.get_line_extents()
+        _inside, b, trailing = layout.xy_to_index(strong.x, lg.y + lg.height // 2)
+        return min(len(self.caption), self.char_index(b) + trailing)
+
+    def move_cursor(self, pos, shift):
+        pos = max(0, min(len(self.caption), pos))
+        if shift:
+            if self.anchor is None:
+                self.anchor = self.cursor
+        else:
+            self.anchor = None
+        self.cursor = pos
+        self.queue_draw()
+
+    def position_at(self, ev):
+        """Character index under a pointer event, or None if it is not on the caption strip."""
+        if self.band is None or not self.caption:
+            return None
+        a = -math.radians(self.angle)
+        dx, dy = ev.x - self.cur_w / 2, ev.y - self.cur_h / 2
+        fx, fy = dx * math.cos(a) - dy * math.sin(a), dx * math.sin(a) + dy * math.cos(a)
+        bx, by, bw, bh, layout, ox, oy = self.band
+        if not (bx <= fx <= bx + bw and by <= fy <= by + bh):
+            return None
+        _inside, b, trailing = layout.xy_to_index(int((fx - ox) * Pango.SCALE), int((fy - oy) * Pango.SCALE))
+        return min(len(self.caption), self.char_index(b) + trailing)
+
     def edit_key(self, ev, k, ctrl):
         """Key handling while writing. Returns True when the key was consumed."""
+        shift = bool(ev.state & Gdk.ModifierType.SHIFT_MASK)
+        sel = self.selection()
+        c = self.cursor
         if k == "Escape":
             self.finish_edit(cancel=True)
-        elif k in ("Return", "KP_Enter") and not (ev.state & Gdk.ModifierType.SHIFT_MASK):
+        elif k in ("Return", "KP_Enter") and not shift:
             self.finish_edit()
         elif k in ("Return", "KP_Enter"):
-            self.set_caption(self.caption + "\n")
-        elif k == "BackSpace":
-            if ctrl:
-                self.set_caption(self.caption.rstrip().rsplit(" ", 1)[0] if " " in self.caption.rstrip() else "")
+            self.replace_selection("\n")
+        elif k in ("Left", "KP_Left"):
+            if sel and not shift:
+                self.move_cursor(sel[0], False)
             else:
-                self.set_caption(self.caption[:-1])
+                self.move_cursor(self.word_left(c) if ctrl else c - 1, shift)
+        elif k in ("Right", "KP_Right"):
+            if sel and not shift:
+                self.move_cursor(sel[1], False)
+            else:
+                self.move_cursor(self.word_right(c) if ctrl else c + 1, shift)
+        elif k in ("Up", "KP_Up"):
+            self.move_cursor(0 if ctrl else self.line_move(c, -1), shift)
+        elif k in ("Down", "KP_Down"):
+            self.move_cursor(len(self.caption) if ctrl else self.line_move(c, 1), shift)
+        elif k in ("Home", "KP_Home"):
+            self.move_cursor(0 if ctrl else self.line_bounds(c)[0], shift)
+        elif k in ("End", "KP_End"):
+            self.move_cursor(len(self.caption) if ctrl else self.line_bounds(c)[1], shift)
+        elif k == "BackSpace":
+            if sel:
+                self.replace_selection("")
+            elif c > 0:
+                self.anchor = self.word_left(c) if ctrl else c - 1
+                self.replace_selection("")
+        elif k in ("Delete", "KP_Delete"):
+            if sel:
+                self.replace_selection("")
+            elif c < len(self.caption):
+                self.anchor = self.word_right(c) if ctrl else c + 1
+                self.replace_selection("")
+        elif ctrl and k in ("a", "A"):
+            self.anchor, self.cursor = 0, len(self.caption)
+            self.queue_draw()
+        elif ctrl and k in ("c", "C", "x", "X"):
+            if sel:
+                self.manager.clipboard.set_text(self.caption[sel[0]:sel[1]], -1)
+                if k in ("x", "X"):
+                    self.replace_selection("")
         elif ctrl and k in ("v", "V"):
             text = self.manager.clipboard.wait_for_text()
             if text:
-                self.set_caption(self.caption + text)
-        elif ctrl and k in ("a", "A", "u", "U"):
-            self.set_caption("")
+                self.replace_selection(text)
         elif not ctrl:
             ch = Gdk.keyval_to_unicode(ev.keyval)
             if ch and (chr(ch).isprintable() or ch == 0x20):
-                self.set_caption(self.caption + chr(ch))
+                self.replace_selection(chr(ch))
         return True
 
     # ---- interaction ----------------------------------------------------
@@ -532,6 +695,12 @@ class Polaroid(Gtk.Window):
         if ev.button == 1 and ev.type == Gdk.EventType._2BUTTON_PRESS:
             self.drag = None
             self.start_edit()
+        elif ev.button == 1 and self.editing is not None and self.position_at(ev) is not None:
+            shift = bool(ev.state & Gdk.ModifierType.SHIFT_MASK)
+            self.move_cursor(self.position_at(ev), shift)
+            if not shift:
+                self.anchor = self.cursor
+            self.sel_drag = True
         elif ev.button == 1:
             self.drag = (ev.x_root - self.x, ev.y_root - self.y)
         elif ev.button == 3:
@@ -539,13 +708,21 @@ class Polaroid(Gtk.Window):
         return True
 
     def on_motion(self, _w, ev):
-        if self.drag:
+        if self.sel_drag:
+            pos = self.position_at(ev)
+            if pos is not None:
+                self.move_cursor(pos, True)
+        elif self.drag:
             self.x, self.y = int(ev.x_root - self.drag[0]), int(ev.y_root - self.drag[1])
             self.move(self.x, self.y)
         return True
 
     def on_release(self, _w, ev):
-        if ev.button == 1 and self.drag:
+        if ev.button == 1 and self.sel_drag:
+            self.sel_drag = False
+            if self.anchor == self.cursor:
+                self.anchor = None
+        elif ev.button == 1 and self.drag:
             self.drag = None
             self.manager.save_soon()
         return True

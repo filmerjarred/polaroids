@@ -52,9 +52,12 @@ Other ways in:
 Double-click a polaroid (or right-click, **Write on it…**, or press Enter
 while it has focus) and type. The text appears in the white strip in a
 handwriting font (Caveat, bundled in `fonts/`, SIL Open Font License).
-**Enter** finishes, **Shift+Enter** starts a new line, **Esc** cancels,
-**Ctrl+V** pastes text and **Ctrl+Backspace** deletes a word. Clicking away
-also finishes. Captions are saved in `state.json`.
+It edits like a normal text box: arrow keys move the caret (Ctrl jumps
+words, Home/End go to the line ends), Shift+arrows or a click-and-drag on the
+text selects, and Ctrl+A / C / X / V select all, copy, cut and paste.
+Backspace and Delete remove a character, a word with Ctrl, or the selection.
+**Enter** finishes, **Shift+Enter** starts a new line, **Esc** cancels.
+Clicking away also finishes. Captions are saved in `state.json`.
 
 ## Data
 
